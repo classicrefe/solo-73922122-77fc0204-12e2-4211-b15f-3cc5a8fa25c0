@@ -177,6 +177,77 @@ def main():
             assert c.post(f"/api/models/{m2}/programs",
                           json={"program_id": "P", "schema": temp_doc(0, 100)}).status_code == 200
 
+    # ---- 试跑报文生成 ----
+    print("试跑报文生成")
+    m3 = f"r{uuid.uuid4().hex[:10]}"
+    assert c.post("/api/models", json={"name": m3}).status_code == 201
+
+    def m3_fw(doc):
+        return c.post(f"/api/models/{m3}/firmware", json={"schema": doc})
+
+    def m3_pg(doc):
+        return c.post(f"/api/models/{m3}/programs",
+                      json={"program_id": "analyzer", "schema": doc})
+
+    # 只追加：先窄后宽，程序与固件同步演进，得到 3 个可区分版本
+    for i, (lo, hi) in enumerate([(0, 0), (0, 1), (0, 2)]):
+        assert m3_pg(temp_doc(lo, hi)).status_code == 200
+        assert m3_fw(temp_doc(lo, hi)).status_code == 200
+    pubs = c.get(f"/api/models/{m3}/programs/analyzer/publishes").json()["records"]
+    ok("列出同一程序的成功发布记录", len(pubs) == 3, str(len(pubs)))
+    rids = [p["record_id"] for p in pubs]
+    r = c.post(f"/api/models/{m3}/trials", json={"program_id": "analyzer",
+                                                "record_ids": rids})
+    body = r.json()
+    ok("试跑生成成功", r.status_code == 200 and body["ok"], r.text)
+    ok("三版两两可区分、最少 2 条", body["minimum"] == 2
+       and body["distinguishable_pairs"] == [[0, 1], [0, 2], [1, 2]],
+       json.dumps(body.get("groups")))
+    ok("三版各自成组", body["groups"] == [[0], [1], [2]], json.dumps(body["groups"]))
+    fw_snapshot = [(f["version"], parse_schema(f["schema"]))
+                   for f in body["snapshot"]["firmwares"]]
+    pg_snapshot = [(p["label"], parse_schema(p["schema"]))
+                   for p in body["snapshot"]["programs"]]
+    ok("快照候选与所选记录一一对应",
+       [p["record_id"] for p in body["snapshot"]["programs"]] == rids)
+    for i, m in enumerate(body["messages"], start=1):
+        msg = m["message"]
+        ok(f"试跑报文{i}是合法报文",
+           any(message_valid(msg, sch) for _, sch in fw_snapshot), json.dumps(msg))
+        ok(f"试跑报文{i}收拒与预期一致",
+           [message_valid(msg, sch) for _, sch in pg_snapshot] == m["accepts"],
+           json.dumps(m))
+    for i, j in body["distinguishable_pairs"]:
+        ok(f"版本{i}/{j}被至少一条报文区分",
+           any(m["accepts"][i] != m["accepts"][j] for m in body["messages"]))
+    r = c.get(f"/api/models/{m3}/trials/{body['trial_id']}")
+    ok("试跑记录可回读", r.status_code == 200 and r.json()["minimum"] == 2)
+
+    # 失败/非法路径
+    r = c.post(f"/api/models/{m3}/trials", json={"program_id": "analyzer",
+                                                "record_ids": rids[:1]})
+    ok("只选 1 条被拒", r.status_code == 422 and "2" in r.json()["message"], r.text)
+    r = c.post(f"/api/models/{m3}/trials", json={"program_id": "analyzer",
+                                                "record_ids": rids + [999999]})
+    ok("混入无关记录被拒", r.status_code == 422, r.text)
+    r = c.post(f"/api/models/{m3}/trials", json={"program_id": "nope",
+                                                "record_ids": rids})
+    ok("错误程序号被拒", r.status_code == 422, r.text)
+
+    # 试跑页面：勾选版本 + 逐条展示接收/拒收
+    r = c.get(f"/models/{m3}")
+    ok("型号页含试跑入口", "生成现场试跑报文" in r.text)
+    r = c.post(f"/models/{m3}/trials", follow_redirects=True,
+               data={"program_id": "analyzer",
+                     "record_ids": [str(i) for i in rids]})
+    ok("网页生成后跳转报文组页", r.status_code == 200
+       and "最少报文数" in r.text and "报文 1" in r.text
+       and "接收" in r.text and "拒收" in r.text, str(r.status_code))
+    r = c.post(f"/models/{m3}/trials", data={"program_id": "analyzer"})
+    ok("网页未选记录提示未能生成", r.status_code == 422 and "请选择" in r.text)
+    r = c.get(f"/models/{m3}/trials/{body['trial_id']}")
+    ok("试跑报文页可打开", r.status_code == 200 and "候选契约" in r.text)
+
     # ---- HTML 页面冒烟 ----
     print("HTML 页面")
     r = c.get("/")

@@ -16,6 +16,8 @@ from db import (Base, DeviceModel, FirmwareFormat, ProgramFormat, PublishLog,
                 SessionLocal, engine)
 from examples import EXAMPLES
 
+import trial as trial_engine
+
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 templates.env.filters["tojson"] = lambda v, indent=2: json.dumps(
@@ -68,11 +70,15 @@ def _model_context(name: str, result=None):
                              .order_by(ProgramFormat.program_id)).scalars().all()
         logs = s.execute(select(PublishLog).where(PublishLog.model_id == model.id)
                          .order_by(PublishLog.id.desc()).limit(50)).scalars().all()
+        counts = service.program_publish_counts(model.id)
+        programs = sorted(programs, key=lambda p: p.program_id)
         s.expunge_all()
         return {
             "model": model, "firmwares": firmwares, "programs": programs,
             "logs": logs, "examples": EXAMPLES, "result": result,
             "max_formats": service.MAX_FORMATS,
+            "publish_counts": counts,
+            "trial": None, "trial_form": None,
         }
 
 
@@ -139,6 +145,37 @@ def prog_publish_html(request: Request, name: str,
         outcome = service.publish_program(model.id, program_id.strip(), doc)
     return templates.TemplateResponse(request, "model.html",
                                       _model_context(name, result=outcome))
+
+
+@app.get("/models/{name}/trials/{trial_id}", response_class=HTMLResponse)
+def trial_report_page(request: Request, name: str, trial_id: int):
+    model = _get_model_or_404(name)
+    run = service.get_trial(model.id, trial_id)
+    if run is None:
+        raise HTTPException(404, "试跑记录不存在")
+    ctx = _model_context(name)
+    ctx["trial_run"] = run
+    return templates.TemplateResponse(request, "trial.html", ctx)
+
+
+@app.post("/models/{name}/trials", response_class=HTMLResponse)
+def trial_create_html(request: Request, name: str,
+                      program_id: str = Form(...),
+                      record_ids: list[int] = Form(default=[])):
+    model = _get_model_or_404(name)
+    try:
+        outcome = service.create_trial(model.id, program_id.strip(), record_ids)
+    except trial_engine.TrialUnproven as e:
+        outcome = service.TrialOutcome(False, f"本次未能生成：{e}", error=str(e))
+    if outcome.ok and outcome.trial_id:
+        # 生成成功后直接打开报文组页面，逐条列出各版本预期
+        return RedirectResponse(f"/models/{name}/trials/{outcome.trial_id}",
+                                status_code=303)
+    ctx = _model_context(name)
+    ctx["trial"] = outcome
+    ctx["trial_form"] = {"program_id": program_id.strip(),
+                         "record_ids": list(record_ids)}
+    return templates.TemplateResponse(request, "model.html", ctx, status_code=422)
 
 
 # ---------------- JSON API ----------------
@@ -222,3 +259,60 @@ def api_publish_program(name: str, body: ProgramIn):
     model = _get_model_or_404(name)
     outcome = service.publish_program(model.id, body.program_id.strip(), body.doc)
     return _outcome_response(outcome)
+
+
+# ---------------- 试跑报文生成（JSON API） ----------------
+
+class TrialIn(BaseModel):
+    program_id: str
+    record_ids: list[int]
+
+
+def _trial_body(run):
+    body = {
+        "trial_id": run.id,
+        "ok": run.report is not None,
+        "program_id": run.snapshot.get("program_id") if run.snapshot else None,
+        "snapshot": run.snapshot,
+        "created_at": str(run.created_at),
+    }
+    if run.report is not None:
+        body.update(run.report)
+    else:
+        body["error"] = run.error
+    return body
+
+
+@app.get("/api/models/{name}/programs/{program_id}/publishes")
+def api_program_publishes(name: str, program_id: str):
+    model = _get_model_or_404(name)
+    records = service.list_program_publishes(model.id, program_id)
+    return {"program_id": program_id,
+            "records": [{"record_id": r["record_id"],
+                         "published_at": str(r["created_at"]),
+                         "schema": r["schema"]} for r in records]}
+
+
+@app.post("/api/models/{name}/trials")
+def api_create_trial(name: str, body: TrialIn):
+    model = _get_model_or_404(name)
+    try:
+        outcome = service.create_trial(model.id, body.program_id.strip(), body.record_ids)
+    except trial_engine.TrialUnproven as e:
+        # 防御：生成器内部所有未证明路径都应返回 TrialUnproven，此处兜底
+        return JSONResponse({"ok": False, "message": f"本次未能生成：{e}",
+                             "error": str(e)}, status_code=409)
+    if outcome.trial_id is None:
+        return JSONResponse({"ok": False, "message": outcome.message,
+                             "error": outcome.error}, status_code=422)
+    run = service.get_trial(model.id, outcome.trial_id)
+    return JSONResponse(_trial_body(run), status_code=200 if outcome.ok else 409)
+
+
+@app.get("/api/models/{name}/trials/{trial_id}")
+def api_get_trial(name: str, trial_id: int):
+    model = _get_model_or_404(name)
+    run = service.get_trial(model.id, trial_id)
+    if run is None:
+        raise HTTPException(404, "试跑记录不存在")
+    return _trial_body(run)

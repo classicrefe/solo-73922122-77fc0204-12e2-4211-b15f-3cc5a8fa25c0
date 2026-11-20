@@ -66,3 +66,16 @@ class PublishLog(Base):
     result = Column(String(16), nullable=False)      # published | rejected | invalid
     detail = Column(JsonDoc, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class TrialRun(Base):
+    """试跑报文组：基于一次已提交视图（固件格式 + 候选程序契约快照）生成。"""
+    __tablename__ = "trial_runs"
+    id = Column(Integer, primary_key=True)
+    model_id = Column(Integer, ForeignKey("device_models.id"), nullable=False, index=True)
+    program_id = Column(String(64), nullable=True)  # 候选程序号
+    record_ids = Column(JsonDoc, nullable=False)    # 所选成功发布记录 id（所选顺序）
+    snapshot = Column(JsonDoc, nullable=False)      # 生成时的固件与候选契约快照
+    report = Column(JsonDoc, nullable=True)         # 成功时的报文/分组/最少性证明；失败为 null
+    error = Column(String(512), nullable=True)      # 失败原因（本次未能生成）
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

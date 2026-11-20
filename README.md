@@ -14,7 +14,7 @@ docker compose up --build
 
 - 操作入口（网页）：http://localhost:8000
 - 健康检查：http://localhost:8000/api/health
-- 数据保存在命名卷 `pgdata`（PostgreSQL），服务重启后已发布格式保留。
+- 数据保存在命名卷 `pgdata`（PostgreSQL），服务重启后已发布格式与试跑记录保留。
 
 ## 网页操作
 
@@ -30,6 +30,22 @@ docker compose up --build
    - **质控码缺省**：固件缺省 `qc`（或写 `null`），把 `qc` 列为 `required` 的程序会被拒，
      反例为不含 `qc` 的报文；程序改为可选并允许 `null` 后通过。
    - **顶层 anyOf**：程序同时接受多种报文形态。
+
+## 现场试跑报文生成
+
+程序升级后仍拒收水质报文时，数据工程师需要确认分析程序实际用了哪版读取契约。
+型号页「生成现场试跑报文」按同一程序选 2～6 条**成功发布记录**作为候选契约，
+在**同一已提交视图**（固件格式 + 候选契约快照）上生成一组可拿到现场试跑的报文：
+
+- 每条试跑报文都至少符合一种已发布的固件写入格式；
+- 凡能用合法报文区分收拒结果的两版，报文组中至少有一条报文能区分它们；
+- 报文总数最少（枚举全部可达收拒向量 + 精确集合覆盖）；
+- 全部合法报文上收拒相同的版本归为一组，网页逐条列出各版本「接收 / 拒收」；
+- 无法证明报文数最少（z3 unknown、超时、复核失败、求解器繁忙）时提示**本次未能生成**，
+  不输出报文组；生成记录（含失败原因）留存于 `trial_runs`。
+
+「同一已提交视图」在 PostgreSQL 用 `REPEATABLE READ` 事务固定，SQLite 用显式
+`BEGIN` 取共享读锁；生成期间其他发布不会混入快照。
 
 ## 受限 JSON Schema 语法（其余一律拒绝）
 
@@ -51,6 +67,11 @@ docker compose up --build
 - **SAT** ⇒ 从模型还原一个反例报文，并用独立的纯 Python 判定器复核
   （确实满足 W、确实被 R 拒收）后随拒绝结果返回。
 
+试跑报文生成复用同一编码：对每个候选版本用 `mask` 指定接收/拒收，求解
+「满足某固件格式 ∧ 各版本收拒恰为 mask」的报文，穷举全部非零 mask；
+任何一步 unknown 或超时都视为「未能证明」，不会输出结果。z3 默认上下文非线程安全，
+所有 z3 操作经进程内锁串行化。
+
 ## 并发与事务
 
 - 每次发布在事务内先对型号行加锁（PostgreSQL `SELECT ... FOR UPDATE`），
@@ -68,16 +89,21 @@ docker compose up --build
 | GET | `/api/models/{name}/log` | 发布日志（含拒绝依据） |
 | POST | `/api/models/{name}/firmware` | 追加固件格式 `{"schema": {...}}` |
 | POST | `/api/models/{name}/programs` | 发布/替换程序格式 `{"program_id": "...", "schema": {...}}` |
+| GET | `/api/models/{name}/programs/{program_id}/publishes` | 同一程序的成功发布记录（候选契约） |
+| POST | `/api/models/{name}/trials` | 生成试跑报文 `{"program_id": "...", "record_ids": [..2~6..]}` |
+| GET | `/api/models/{name}/trials/{id}` | 取试跑报文组（含快照、分组、最少性证明） |
 
-响应：成功 `200 {"ok": true, ...}`；不兼容 `409 {"ok": false, "problems": [{firmware_version, program_id, counterexample}]}`；语法/上限错误 `422`。
+响应：成功 `200 {"ok": true, ...}`；不兼容 `409 {"ok": false, "problems": [...]}`；语法/上限错误 `422`。
+试跑生成成功 `200`（含 `messages/groups/proof`），未能证明最少时为 `409 {"ok": false, "error": ...}`。
 
 ## 本地开发与自测
 
 ```bash
 pip install -r app/requirements.txt httpx
 python3 tests/test_units.py                 # 语法子集 + z3 判定单元自测
+python3 tests/test_trial.py                 # 试跑生成：分组/最少性/穷举对拍/未证明路径
 cd app && DATABASE_URL=sqlite:////tmp/contracts.db uvicorn main:app --port 8000 &
-python3 tests/selftest.py                   # 集成自测（示例/上限/并发/页面）
+python3 tests/selftest.py                   # 集成自测（示例/上限/并发/试跑/页面）
 ```
 
 `DATABASE_URL` 缺省为 SQLite（便于本地自测）；Compose 中注入 PostgreSQL 连接串。
@@ -87,14 +113,16 @@ python3 tests/selftest.py                   # 集成自测（示例/上限/并�
 ```
 app/
   main.py         FastAPI 入口（HTML 页面 + JSON API）
-  service.py      发布事务：加锁 → 全量检查 → 落库/回滚
+  service.py      发布事务：加锁 → 全量检查 → 落库/回滚；试跑生成与快照
   solver.py       z3 编码与全量兼容判定（含反例复核）
+  trial.py        试跑报文：可达收拒向量枚举 + 分组 + 精确最小覆盖
   schema_spec.py  受限 JSON Schema 子集解析与纯 Python 报文判定
   db.py           SQLAlchemy 模型（PostgreSQL JSONB / SQLite JSON）
   examples.py     温度扩范围、质控码缺省、anyOf 示例
-  templates/      页面模板
+  templates/      页面模板（型号页 / 试跑报文页）
 tests/
   test_units.py   单元自测
+  test_trial.py   试跑生成自测（含穷举对拍）
   selftest.py     集成自测
 docker-compose.yml
 ```

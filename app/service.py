@@ -6,11 +6,15 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from sqlalchemy import select, update
+from sqlalchemy.orm import Session
 
 from db import (DeviceModel, FirmwareFormat, ProgramFormat, PublishLog,
-                SessionLocal)
+                SessionLocal, engine)
 from schema_spec import SchemaError, parse_schema
 from solver import check_compatibility
+
+import trial as trial_engine
+from db import TrialRun
 
 MAX_FORMATS = 8  # 每型号固件格式、程序格式各至多 8 份
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -140,3 +144,166 @@ def publish_program(model_id: int, program_id: str, raw_doc) -> PublishOutcome:
                          detail={"checked_pairs": len(fw_pairs) * len(prog_pairs)}))
         s.commit()
         return PublishOutcome(True, f"程序「{program_id}」读取格式已发布")
+
+
+# ---------------- 试跑报文生成 ----------------
+
+
+@dataclass
+class TrialOutcome:
+    ok: bool
+    message: str
+    trial_id: Optional[int] = None
+    report: Optional[dict] = None
+    error: Optional[str] = None
+
+
+def list_program_publishes(model_id: int, program_id: str):
+    """同一程序的全部成功发布记录（按发布时间升序），供网页勾选候选契约。"""
+    with SessionLocal() as s:
+        rows = s.execute(
+            select(PublishLog)
+            .where(PublishLog.model_id == model_id,
+                   PublishLog.action == "program",
+                   PublishLog.program_id == program_id,
+                   PublishLog.result == "published")
+            .order_by(PublishLog.id)).scalars().all()
+        return [{"record_id": r.id, "created_at": r.created_at, "schema": r.doc}
+                for r in rows]
+
+
+def program_publish_counts(model_id: int):
+    """每个程序号的发布成功记录数。"""
+    from sqlalchemy import func
+    with SessionLocal() as s:
+        rows = s.execute(
+            select(PublishLog.program_id, func.count(PublishLog.id))
+            .where(PublishLog.model_id == model_id,
+                   PublishLog.action == "program",
+                   PublishLog.result == "published")
+            .group_by(PublishLog.program_id)).all()
+        return {pid: cnt for pid, cnt in rows}
+
+
+def _snapshot_state(model_id: int, program_id: str, record_ids):
+    """在同一已提交视图里读取固件格式与候选契约（程序发布记录）。
+
+    PostgreSQL 用 REPEATABLE READ 事务固定快照；SQLite 在同一读事务内完成两次查询
+    （SQLite 先取共享读锁，期间其他写入无法提交）。
+    返回 (firmwares, records, ordinals)，ordinals 为所选记录在该程序全部成功发布
+    记录中的版本序号（从 1 开始）。
+    """
+    is_pg = engine.dialect.name == "postgresql"
+    with engine.connect().execution_options(
+            isolation_level="REPEATABLE READ" if is_pg else "SERIALIZABLE") as conn:
+        with Session(bind=conn, expire_on_commit=False) as s:
+            # SQLite 默认延迟开启读事务；显式 BEGIN 立刻取共享读锁，
+            # 保证两次查询看到同一个已提交视图（写者需等快照关闭）。
+            if not is_pg:
+                conn.exec_driver_sql("BEGIN")
+            firmwares = s.execute(
+                select(FirmwareFormat).where(FirmwareFormat.model_id == model_id)
+                .order_by(FirmwareFormat.version)).scalars().all()
+            history = s.execute(
+                select(PublishLog.id)
+                .where(PublishLog.model_id == model_id,
+                       PublishLog.action == "program",
+                       PublishLog.program_id == program_id,
+                       PublishLog.result == "published")
+                .order_by(PublishLog.id)).scalars().all()
+            records = s.execute(
+                select(PublishLog)
+                .where(PublishLog.model_id == model_id,
+                       PublishLog.action == "program",
+                       PublishLog.program_id == program_id,
+                       PublishLog.result == "published",
+                       PublishLog.id.in_(record_ids))
+                .order_by(PublishLog.id)).scalars().all()
+            ordinal_of = {rid: i for i, rid in enumerate(history, start=1)}
+            ordinals = {r.id: ordinal_of[r.id] for r in records}
+            s.expunge_all()
+            return firmwares, records, ordinals
+
+
+def create_trial(model_id: int, program_id: str, record_ids):
+    """按选定程序与 2~6 条成功发布记录生成最少试跑报文组。"""
+    try:
+        record_ids = list(dict.fromkeys(int(r) for r in record_ids))  # 去重保序
+    except (TypeError, ValueError):
+        return TrialOutcome(False, "发布记录编号不合法", error="发布记录编号不合法")
+    if not 2 <= len(record_ids) <= 6:
+        return TrialOutcome(False, "请选择同一程序的 2～6 条成功发布记录",
+                            error="候选版本数必须是 2～6")
+    if not valid_name(program_id):
+        return TrialOutcome(False, "程序号不合法", error="程序号不合法")
+
+    with SessionLocal() as s:
+        if s.get(DeviceModel, model_id) is None:
+            return TrialOutcome(False, "型号不存在", error="型号不存在")
+
+    firmwares, records, ordinals = _snapshot_state(model_id, program_id, record_ids)
+
+    if len(records) != len(record_ids):
+        return TrialOutcome(False, "所选记录不属于该程序或不是成功发布记录",
+                            error="所选发布记录无效")
+    if not firmwares:
+        return TrialOutcome(
+            False, "视图内没有已发布的固件格式，无法产生合法报文",
+            error="没有已发布的固件格式")
+
+    try:
+        fw_pairs = [(f.version, parse_schema(f.doc)) for f in firmwares]
+        programs = _records_as_programs(records, ordinals)
+        snapshot = {
+            "firmwares": [{"version": f.version, "schema": f.doc} for f in firmwares],
+            "program_id": program_id,
+            "programs": programs,
+        }
+        report = trial_engine.build_report(
+            fw_pairs, [(p["label"], parse_schema(p["schema"])) for p in programs])
+    except (SchemaError, trial_engine.TrialUnproven) as e:
+        reason = (f"候选契约无法解析：{e}" if isinstance(e, SchemaError) else str(e))
+        snapshot = {
+            "firmwares": [{"version": f.version, "schema": f.doc} for f in firmwares],
+            "program_id": program_id,
+            "programs": _records_as_programs(records, ordinals),
+        }
+        with SessionLocal() as s:
+            run = TrialRun(model_id=model_id, program_id=program_id,
+                           record_ids=record_ids, snapshot=snapshot,
+                           report=None, error=reason[:512])
+            s.add(run)
+            s.commit()
+            trial_id = run.id
+        return TrialOutcome(False, f"本次未能生成：{reason}", trial_id=trial_id,
+                            error=reason)
+
+    with SessionLocal() as s:
+        run = TrialRun(model_id=model_id, program_id=program_id,
+                       record_ids=record_ids, snapshot=snapshot,
+                       report=report, error=None)
+        s.add(run)
+        s.commit()
+        trial_id = run.id
+
+    return TrialOutcome(True, f"已生成 {report['minimum']} 条试跑报文",
+                        trial_id=trial_id, report=report)
+
+
+def _records_as_programs(records, ordinals):
+    return [{
+        "record_id": r.id,
+        "label": f"第 {ordinals[r.id]} 版",
+        "published_at": str(r.created_at),
+        "schema": r.doc,
+    } for r in records]
+
+
+def get_trial(model_id: int, trial_id: int):
+    with SessionLocal() as s:
+        run = s.execute(select(TrialRun).where(TrialRun.model_id == model_id,
+                                               TrialRun.id == trial_id)).scalar_one_or_none()
+        if run is None:
+            return None
+        s.expunge_all()
+        return run

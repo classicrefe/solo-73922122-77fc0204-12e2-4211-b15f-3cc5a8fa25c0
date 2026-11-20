@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}试跑报文组 #{{ trial_run.id }} · 型号 {{ model.name }}{% endblock %}
+{% block content %}
+<h1>试跑报文组 #{{ trial_run.id }} <span class="tag">{{ model.name }}</span></h1>
+<p class="muted">程序「{{ trial_run.snapshot.program_id }}」的候选契约取自同一已提交视图。
+以下每一条报文都是合法报文（至少满足一种已发布的固件写入格式），并逐条列出各候选版本的预期结果。</p>
+
+{% if trial_run.report %}
+  {% set rep = trial_run.report %}
+  <div class="card notice-ok">
+    <h3>✔ 最少报文数：{{ rep.minimum }} 条</h3>
+    <p class="muted">证明依据：{{ rep.proof.method }}；枚举到 {{ rep.proof.achievable_vectors }} 个可达收拒向量，
+    z3 共判定 {{ rep.proof.solver_checks }} 次。可区分版本对 {{ rep.distinguishable_pairs | length }} 对，
+    报文组已全部覆盖。凡能用合法报文区分的两版，至少被其中一条报文区分。</p>
+  </div>
+
+  <h2>版本分组</h2>
+  <p class="muted">在所有合法报文上收拒完全相同的版本归为一组；不同组之间一定存在合法报文能区分。</p>
+  <table>
+    <tr><th>组</th><th>候选版本</th><th>该组代表记录</th></tr>
+    {% for g in rep.groups %}
+    <tr>
+      <td>组 {{ loop.index }}</td>
+      <td>{% for idx in g %}<span class="tag">{{ trial_run.snapshot.programs[idx].label }}</span>{% endfor %}</td>
+      <td class="muted">{% for idx in g %}#{{ trial_run.snapshot.programs[idx].record_id }}{% if not loop.last %}, {% endif %}{% endfor %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h2>试跑报文（共 {{ rep.minimum }} 条）</h2>
+  {% if rep.minimum == 0 %}
+  <div class="card"><p>这些候选版本在所有合法报文上的收拒完全相同，没有能用合法报文区分的版本对，
+  因此无需试跑报文。</p></div>
+  {% endif %}
+  {% for m in rep.messages %}
+  <div class="card">
+    <b>报文 {{ m.index }}</b>
+    <span class="muted">（取自固件写入格式 v{{ m.firmware_version }}，满足该固件格式）</span>
+    <pre>{{ m.message | tojson }}</pre>
+    <table>
+      <tr><th>候选版本</th><th>预期</th><th>发布记录</th></tr>
+      {% for p in trial_run.snapshot.programs %}
+      <tr>
+        <td>{{ p.label }}</td>
+        <td>{% if m.accepts[loop.index0] %}<span style="color:var(--ok)">接收</span>
+            {% else %}<span style="color:var(--bad)">拒收</span>{% endif %}</td>
+        <td class="muted">#{{ p.record_id }} · {{ p.published_at }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% endfor %}
+
+  <h2>候选契约快照与固件视图</h2>
+  <div class="cols">
+    <div>
+      <h3>候选契约</h3>
+      {% for p in trial_run.snapshot.programs %}
+      <div class="card"><b>{{ p.label }}</b> <span class="muted">记录 #{{ p.record_id }}</span>
+        <pre>{{ p.schema | tojson }}</pre></div>
+      {% endfor %}
+    </div>
+    <div>
+      <h3>固件写入格式</h3>
+      {% for f in trial_run.snapshot.firmwares %}
+      <div class="card"><b>v{{ f.version }}</b><pre>{{ f.schema | tojson }}</pre></div>
+      {% endfor %}
+    </div>
+  </div>
+{% else %}
+  <div class="card notice-bad"><h3>✘ 本次未能生成</h3>
+    <p>{{ trial_run.error }}</p>
+    <p class="muted">无法证明报文数最少时不输出报文组；可调整候选记录或稍后重试。</p>
+  </div>
+{% endif %}
+
+<p><a href="/models/{{ model.name }}">← 返回型号页</a></p>
+{% endblock %}

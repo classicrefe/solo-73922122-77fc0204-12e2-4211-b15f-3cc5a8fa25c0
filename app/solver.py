@@ -9,12 +9,22 @@
 """
 from __future__ import annotations
 
+import threading
+
 from z3 import And, Bool, Implies, Int, Not, Or, Solver, is_true, sat
 
 from schema_spec import Schema, message_valid
 
 KIND_NULL, KIND_INT, KIND_STR = 0, 1, 2
 SOLVER_TIMEOUT_MS = 15000
+
+# z3 的默认上下文不是线程安全的：并发创建/求解会让进程崩溃。
+# 所有 z3 操作（建表达式、求解、取模型）都在此锁内串行执行。
+Z3_LOCK = threading.RLock()
+
+
+class SolveUnknown(RuntimeError):
+    """z3 未能在限定时间内给出 sat/unsat；不能据此声称完成了全量判定。"""
 
 
 class _Encoder:
@@ -79,6 +89,11 @@ class _Encoder:
 
 def find_counterexample(write: Schema, read: Schema):
     """若存在被 read 拒收的 write 合法报文，返回该报文 dict；否则返回 None。"""
+    with Z3_LOCK:
+        return _find_counterexample(write, read)
+
+
+def _find_counterexample(write: Schema, read: Schema):
     names = set()
     for sch in (write, read):
         for b in sch.branches:
@@ -104,7 +119,7 @@ def find_counterexample(write: Schema, read: Schema):
     r = s.check()
     if r != sat:
         if str(r) == "unknown":
-            raise RuntimeError("z3 求解超时/未知，无法完成全量判定")
+            raise SolveUnknown("z3 求解超时/未知，无法完成全量判定")
         return None
 
     m = s.model()

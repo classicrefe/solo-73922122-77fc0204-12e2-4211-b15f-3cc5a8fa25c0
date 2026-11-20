@@ -80,6 +80,73 @@
 </div>
 {% endfor %}
 
+<h2>生成现场试跑报文</h2>
+<p class="muted">选择同一程序最近的成功发布记录作为候选契约（2～6 条），以当前已提交视图中的
+固件格式与这些候选契约为准，生成一组能拿去现场试跑的报文：总数最少，且凡是能用合法报文
+区分的两版，结果中至少有一条报文能区分它们。全部合法报文上收拒相同的版本会归为一组。</p>
+
+{% if trial %}
+  {% if trial.ok %}
+  <div class="card notice-ok"><h3>✔ {{ trial.message }}</h3>
+    <a href="/models/{{ model.name }}/trials/{{ trial.trial_id }}">查看试跑报文组 →</a></div>
+  {% else %}
+  <div class="card notice-bad"><h3>✘ 本次未能生成</h3>
+    <p>{{ trial.message }}</p>
+    <p class="muted">未能在限定条件下证明报文数最少，因此不输出报文组，避免现场误用。</p></div>
+  {% endif %}
+{% endif %}
+
+{% if publish_counts %}
+<form method="post" action="/models/{{ model.name }}/trials" id="trial-form">
+  <div class="card">
+    <p>程序号：
+      <select name="program_id" id="trial_prog" required onchange="loadPublishes(this.value)">
+        <option value="">请选择</option>
+        {% for p in programs %}
+        <option value="{{ p.program_id }}"
+          {% if trial_form and trial_form.program_id == p.program_id %}selected{% endif %}>
+          {{ p.program_id }}（{{ publish_counts.get(p.program_id, 0) }} 条成功发布记录）</option>
+        {% endfor %}
+      </select>
+      <span class="muted">只列出已登记的程序；同一程序需至少有 2 条成功发布记录。</span>
+    </p>
+    <div id="trial_records" class="muted">选择程序后列出成功发布记录。</div>
+    <p><button type="submit">生成最少试跑报文组</button></p>
+  </div>
+</form>
+<script>
+const TRIAL_PRESELECT = {{ (trial_form.record_ids if trial_form else []) | tojsonc }};
+async function loadPublishes(pid) {
+  const box = document.getElementById('trial_records');
+  if (!pid) { box.textContent = '选择程序后列出成功发布记录。'; return; }
+  box.textContent = '加载中…';
+  const r = await fetch(`/api/models/{{ model.name }}/programs/${encodeURIComponent(pid)}/publishes`);
+  if (!r.ok) { box.textContent = '加载失败'; return; }
+  const data = await r.json();
+  box.innerHTML = '';
+  for (const rec of data.records) {
+    const id = 'rec-' + rec.record_id;
+    const label = document.createElement('label');
+    label.style.display = 'block';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.name = 'record_ids'; cb.value = rec.record_id; cb.id = id;
+    if (TRIAL_PRESELECT.includes(rec.record_id)) cb.checked = true;
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(` 记录 #${rec.record_id}（${rec.published_at}）`));
+    const pre = document.createElement('pre');
+    pre.textContent = JSON.stringify(rec.schema, null, 2);
+    label.appendChild(pre);
+    box.appendChild(label);
+  }
+  if (!data.records.length) box.textContent = '该程序没有成功发布记录。';
+}
+window.addEventListener('DOMContentLoaded', () => {
+  const sel = document.getElementById('trial_prog');
+  if (sel && sel.value) loadPublishes(sel.value);
+});
+</script>
+{% endif %}
+
 <h2>发布日志（最近 50 条，含拒绝依据）</h2>
 <table>
   <tr><th>时间</th><th>动作</th><th>结果</th><th>详情</th></tr>
